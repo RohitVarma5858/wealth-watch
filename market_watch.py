@@ -1,37 +1,53 @@
 #!/usr/bin/env python3
 """
+Uses the Twelve Data API (not yfinance/Yahoo Finance - Yahoo's undocumented
+API gets blocked by the cloud sandbox's egress policy, likely because
+scraping it violates Yahoo's ToS; Twelve Data is a proper registered API).
+
+Coverage note: Twelve Data's free plan only covers US-listed securities.
+The user's Canadian-listed ETFs (VFV.TO, XQQ.TO, XIC.TO, TEC.TO) and raw
+index symbols (SPX, NDX) are not available on the free plan, so broad
+"index" exposure is approximated with SPY (S&P 500) and QQQ (Nasdaq 100)
+instead. VIX is dropped entirely - there's no ETF that tracks it accurately
+enough to be worth showing.
+
+The free plan is also rate-limited to 8 credits/minute (each symbol in a
+request = 1 credit), so any multi-symbol call is chunked into groups of 7
+with a cooldown between chunks.
+
 Two modes:
 
-  check  - lightweight, self-contained hourly run. Fetches near-live prices
-           for the broad indices, checks for an intraday crash (>=5% below
-           yesterday's close) or a sustained weekly decline (>=5% over the
-           trailing week), and sends an ntfy alert directly if triggered
-           (with a cooldown so a sustained drop doesn't re-alert every hour).
-           No news research - this mode never calls out to an LLM.
+  check  - lightweight, self-contained hourly run. Checks SPY/QQQ for an
+           intraday crash (>=5% below yesterday's close) or a sustained
+           weekly decline (>=5% over the trailing week), and sends an ntfy
+           alert directly if triggered, with a cooldown so a sustained drop
+           doesn't re-alert every hour. No news research - never calls out
+           to an LLM.
 
-  digest - fetches the full snapshot (indices, gold, defense/war-tech,
-           personal holdings) and prints it as JSON. Does NOT send any
-           notification or write any report - that's left to the calling
-           agent, which has web search available to research *why* things
-           moved and can write an honest, sourced weekly summary instead of
-           this script guessing.
+  digest - fetches the full watchlist snapshot and prints it as JSON. Does
+           NOT send any notification or write any report - that's left to
+           the calling agent, which has web search available to research
+           *why* things moved instead of this script guessing.
 """
 import json
 import os
 import sys
+import time
 from datetime import date
 
 import requests
-import yfinance as yf
 
+API_KEY = os.environ["TWELVEDATA_API_KEY"]
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "wealth_watch_alerts")
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
+BASE_URL = "https://api.twelvedata.com"
 
-INDICES = {
-    "^GSPC": "S&P 500",
-    "^NDX": "Nasdaq 100",
-    "^GSPTSE": "TSX Composite",
-    "^VIX": "VIX (volatility)",
+CHUNK_SIZE = 7
+CHUNK_COOLDOWN_SECONDS = 65
+
+INDICES = {  # ETF proxies - see module docstring
+    "SPY": "S&P 500 (SPY proxy)",
+    "QQQ": "Nasdaq 100 (QQQ proxy)",
 }
 
 GOLD = {
@@ -47,10 +63,6 @@ DEFENSE_WAR_TECH = {
 }
 
 HOLDINGS = {
-    "VFV.TO": "Vanguard S&P 500 (CAD)",
-    "XQQ.TO": "iShares Nasdaq 100 (CAD)",
-    "XIC.TO": "iShares Core S&P/TSX Composite",
-    "TEC.TO": "Tech ETF (TEC.TO)",
     "MRVL": "Marvell Technology",
     "NVDA": "Nvidia",
     "CHPS": "Semiconductor ETF (CHPS)",
@@ -60,42 +72,75 @@ HOLDINGS = {
 
 ALL_TICKERS = {**INDICES, **GOLD, **DEFENSE_WAR_TECH, **HOLDINGS}
 
-# VIX is excluded from dip-alert triggers: VIX *falling* means fear is
-# decreasing (a calm signal, not a crash), so the "down = bad" dip logic
-# below doesn't apply to it. It's still shown in the snapshot/digest.
-DIP_CHECK_INDICES = {k: v for k, v in INDICES.items() if k != "^VIX"}
-
 DIP_THRESHOLD_PCT = -5.0
 REALERT_DEEPENING_PCT = 2.0  # only re-alert same day if the drop gets at least this much worse
 
 
-def pct_change(series):
-    if len(series) < 2:
-        return None
-    return round((series.iloc[-1] / series.iloc[0] - 1) * 100, 2)
+def chunked(items, size):
+    items = list(items)
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
 
 
-def fetch_snapshot():
-    data = yf.download(list(ALL_TICKERS.keys()), period="10d", progress=False, group_by="ticker")
-    snapshot = {}
-    for ticker, label in ALL_TICKERS.items():
-        try:
-            closes = data[ticker]["Close"].dropna()
-        except Exception:
-            closes = []
-        if len(closes) == 0:
-            snapshot[ticker] = {"label": label, "error": "no data"}
+MAX_429_RETRIES = 5
+
+
+def td_get(endpoint, symbols, extra_params=None):
+    """Chunked GET across `symbols`, merging results into one dict keyed by symbol.
+
+    Retries on 429 rather than failing outright: back-to-back runs (or an
+    hourly check overlapping a digest run) can leave the per-minute credit
+    window already partly consumed when a chunk fires.
+    """
+    merged = {}
+    for i, chunk in enumerate(chunked(symbols, CHUNK_SIZE)):
+        if i > 0:
+            time.sleep(CHUNK_COOLDOWN_SECONDS)
+        params = {"symbol": ",".join(chunk), "apikey": API_KEY, **(extra_params or {})}
+        for attempt in range(MAX_429_RETRIES + 1):
+            r = requests.get(f"{BASE_URL}/{endpoint}", params=params, timeout=30)
+            if r.status_code != 429:
+                break
+            if attempt == MAX_429_RETRIES:
+                r.raise_for_status()
+            time.sleep(CHUNK_COOLDOWN_SECONDS)
+        r.raise_for_status()
+        data = r.json()
+        if len(chunk) == 1:
+            merged[chunk[0]] = data
+        else:
+            merged.update(data)
+    return merged
+
+
+def fetch_quotes(symbols):
+    raw = td_get("quote", symbols)
+    result = {}
+    for sym in symbols:
+        entry = raw.get(sym, {})
+        if "close" not in entry or "percent_change" not in entry:
+            result[sym] = {"error": entry.get("message", "no data")}
             continue
-        last_close = round(float(closes.iloc[-1]), 2)
-        day_change = pct_change(closes.iloc[-2:]) if len(closes) >= 2 else None
-        week_change = pct_change(closes)
-        snapshot[ticker] = {
-            "label": label,
-            "last_close": last_close,
-            "day_change_pct": day_change,
-            "week_change_pct": week_change,
+        result[sym] = {
+            "price": round(float(entry["close"]), 2),
+            "day_change_pct": round(float(entry["percent_change"]), 2),
         }
-    return snapshot
+    return result
+
+
+def fetch_week_changes(symbols):
+    raw = td_get("time_series", symbols, {"interval": "1day", "outputsize": "6"})
+    result = {}
+    for sym in symbols:
+        entry = raw.get(sym, {})
+        values = entry.get("values")
+        if not values or len(values) < 2:
+            result[sym] = None
+            continue
+        latest_close = float(values[0]["close"])
+        oldest_close = float(values[-1]["close"])
+        result[sym] = round((latest_close / oldest_close - 1) * 100, 2)
+    return result
 
 
 def classify(ticker):
@@ -129,37 +174,26 @@ def notify(title, message):
     )
 
 
-def intraday_change(ticker):
-    try:
-        fi = yf.Ticker(ticker).fast_info
-        last = fi.get("lastPrice") if hasattr(fi, "get") else fi["lastPrice"]
-        prev_close = fi.get("previousClose") if hasattr(fi, "get") else fi["previousClose"]
-        if not last or not prev_close:
-            return None
-        return round((last / prev_close - 1) * 100, 2)
-    except Exception:
-        return None
-
-
 def run_check():
     state = load_state()
+    index_symbols = list(INDICES.keys())
+
+    quotes = fetch_quotes(index_symbols)
     worst = None  # (pct, ticker, label, trigger_type)
 
-    for ticker, label in DIP_CHECK_INDICES.items():
-        ic = intraday_change(ticker)
-        if ic is not None and ic <= DIP_THRESHOLD_PCT:
-            if worst is None or ic < worst[0]:
-                worst = (ic, ticker, label, "intraday")
+    for sym, label in INDICES.items():
+        dc = quotes.get(sym, {}).get("day_change_pct")
+        if dc is not None and dc <= DIP_THRESHOLD_PCT:
+            if worst is None or dc < worst[0]:
+                worst = (dc, sym, label, "intraday")
 
     if worst is None:
-        # only bother with the (slower) weekly-history fetch if no intraday
-        # crash already fired, since it's the same threshold check either way
-        snapshot = fetch_snapshot()
-        for ticker, label in DIP_CHECK_INDICES.items():
-            wc = snapshot.get(ticker, {}).get("week_change_pct")
+        week_changes = fetch_week_changes(index_symbols)
+        for sym, label in INDICES.items():
+            wc = week_changes.get(sym)
             if wc is not None and wc <= DIP_THRESHOLD_PCT:
                 if worst is None or wc < worst[0]:
-                    worst = (wc, ticker, label, "weekly")
+                    worst = (wc, sym, label, "weekly")
 
     result = {"date": date.today().isoformat(), "triggered": worst is not None}
 
@@ -194,14 +228,25 @@ def run_check():
 
 
 def run_digest():
-    snapshot = fetch_snapshot()
-    result = {
-        "date": date.today().isoformat(),
-        "snapshot": {
-            ticker: {**entry, "category": classify(ticker)}
-            for ticker, entry in snapshot.items()
-        },
-    }
+    symbols = list(ALL_TICKERS.keys())
+    quotes = fetch_quotes(symbols)
+    week_changes = fetch_week_changes(symbols)
+
+    snapshot = {}
+    for sym, label in ALL_TICKERS.items():
+        q = quotes.get(sym, {})
+        if "error" in q:
+            snapshot[sym] = {"label": label, "category": classify(sym), "error": q["error"]}
+            continue
+        snapshot[sym] = {
+            "label": label,
+            "category": classify(sym),
+            "last_close": q.get("price"),
+            "day_change_pct": q.get("day_change_pct"),
+            "week_change_pct": week_changes.get(sym),
+        }
+
+    result = {"date": date.today().isoformat(), "snapshot": snapshot}
     print(json.dumps(result, indent=2))
 
 
